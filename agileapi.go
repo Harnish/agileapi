@@ -3,9 +3,7 @@ package agileapi
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/gorilla/rpc/v2/json2"
 	"io"
 	"io/ioutil"
 	"log"
@@ -13,6 +11,8 @@ import (
 	"os"
 	"os/user"
 	"strings"
+
+	"github.com/gorilla/rpc/v2/json2"
 )
 
 type AgileApi struct {
@@ -69,11 +69,13 @@ type ListResponse struct {
 }
 
 type StatResult struct {
-	Code  int `json:"code"`
-	Mtime int `json:"mtime"`
-	Size  int `json:"size"`
-	Type  int `json:"type"`
-	Ctime int `json:"ctime"`
+	Code     int    `json:"code"`
+	Mtime    int    `json:"mtime"`
+	Size     int    `json:"size"`
+	Type     int    `json:"type"`
+	Ctime    int    `json:"ctime"`
+	Checksum string `json:"checksum"`
+	MimeType string `json:"mimetype"`
 }
 
 type StatResponse struct {
@@ -83,11 +85,8 @@ type StatResponse struct {
 }
 
 type AuthenticateResponse struct {
-	Code  int    `json:"code"`
-	Token string `json:"token"`
-	Uid   int    `json:"uid"`
-	Gid   int    `json:"gid"`
-	Path  string `json:"path"`
+	Code   int           `json:"code"`
+	Result []interface{} `json:result`
 }
 
 type ActionResponse struct {
@@ -120,23 +119,24 @@ func New(username, password, url string, debug bool) *AgileApi {
 	if exists {
 		tokenbyte, _ := ioutil.ReadFile(agiletokenfile)
 		mytoken := string(tokenbyte)
-		if TestToken(mytoken, url, debug) {
-			me := &AgileApi{
-				Username:   username,
-				Password:   password,
-				Token:      mytoken,
-				Url:        url,
-				Debug:      debug,
-				Secure:     true,
-				TokenCache: agiletokenfile,
-			}
+
+		me := &AgileApi{
+			Username:   username,
+			Password:   password,
+			Token:      mytoken,
+			Url:        url,
+			Debug:      debug,
+			Secure:     true,
+			TokenCache: agiletokenfile,
+		}
+		if me.TestToken(mytoken, url) {
 			return me
 		}
 	}
 	// If the saved token is no longer valid, do this.
 	mytoken, err := Authenticate(username, password, url, debug)
 	if err != nil {
-		fmt.Println("Authentication Failed.  Trying Again.")
+		fmt.Println("Authentication Failed.  Trying Again. Error: ", err)
 
 		mytoken, err = Authenticate(username, password, url, debug)
 		if err != nil {
@@ -172,147 +172,116 @@ func (me *AgileApi) ReAuth() {
 	return
 }
 
-func Authenticate(username, password, url string, debug bool) (token string, err error) {
-	args := []string{username, password, "true"}
-	output := jsonrpcCall(url, "login", "POST", args, debug)
-	if output == nil {
-		err = errors.New("Login Failed")
-		return
+func Authenticate(username, password, url string, debug bool) (string, error) {
+	args := []interface{}{username, password, "true"}
+	output := jsonrpcCallNoDecode(url, "login", "POST", args, debug)
+	var dec AuthenticateResponse
+	err := json.Unmarshal([]byte(output), &dec)
+	if err != nil {
+		return "", err
 	}
-	token = output[0].(string)
+	if dec.Result[0].(string) == "" {
+		return "", fmt.Errorf("Login Failed: %#v", dec)
+	}
+	return dec.Result[0].(string), nil
+}
+
+func jsonrpcCall(url, method, action string, args []interface{}, debug bool) (output []interface{}, err error) {
+	jsonstring := jsonrpcCallNoDecode(url, method, action, args, debug)
+	err = json.Unmarshal([]byte(jsonstring), &output)
 	return
 }
 
-func jsonrpcCall(url, method, action string, args []string, debug bool) (output []interface{}) {
-
-	message, err := json2.EncodeClientRequest(method, args)
-	if err != nil {
-		log.Fatalf("%s", err)
-
-	}
-	if debug {
-		fmt.Println(string(message))
-	}
-	req, err := http.NewRequest(action, url, bytes.NewBuffer(message))
-	if err != nil {
-		log.Fatalf("%s", err)
-
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := new(http.Client)
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatalf("Error in sending request to %s. %s", url, err)
-
-	}
-	defer resp.Body.Close()
-	err = json2.DecodeClientResponse(resp.Body, &output)
-	if err != nil {
-		log.Fatalf("Couldn't decode response. %s", err)
-
-	}
-	return
-}
-
-func DoAction(url, method, action string, args []interface{}, debug bool) (output bool) {
+func DoAction(url, method, action string, args []interface{}, debug bool) error {
 	outputjson := jsonrpcCallNoDecode(url, method, action, args, debug)
 	var dec ActionResponse
 	err := json.Unmarshal([]byte(outputjson), &dec)
 	if err != nil {
-		fmt.Println(err)
-		output = false
-		return
+		return err
 	}
 	if dec.Result == 0 {
-		output = true
-		return
+		return nil
 	} else if dec.Result == -10001 {
-		//FIXME
-		fmt.Println("Token Expired, retry auth.")
+		return fmt.Errorf("Token Expired.")
 	}
-	output = false
-	return
+	return fmt.Errorf("Unknown response: %d", dec.Result)
+
 }
 
 func (me *AgileApi) CheckAuth() {
-	if !TestToken(me.Token, me.Url, me.Debug) {
+	if !me.TestToken(me.Token, me.Url) {
 		me.ReAuth()
 	}
 }
 
-func TestToken(token, url string, debug bool) (output bool) {
-	if debug {
-		fmt.Println("TESTING TOKEN")
-	}
+func (me *AgileApi) TestToken(token, url string) (output bool) {
+	me.writedebug("Testing Token")
+
 	args := []interface{}{token}
-	outputf := jsonrpcCallNoDecode(url, "noop", "POST", args, debug)
+	outputf := jsonrpcCallNoDecode(url, "noop", "POST", args, me.Debug)
 	var dec NoOpResponse
 	err := json.Unmarshal([]byte(outputf), &dec)
 	if err != nil {
 		return false
 	}
 	if dec.Result.Code == 0 {
-		if debug {
-			fmt.Println("Cached Credentials still valid.  Using.")
-		}
+		me.writedebug("Cached Credentials still valid.  Using.")
 		return true
 	}
-	if debug {
-		fmt.Println("Cached Credentials are not valid.")
-	}
+	me.writedebug("Cached Credentials are not valid.")
 	return false
 }
 
-func (me *AgileApi) SetMTime(path, mtime string) (output bool) {
+func (me *AgileApi) SetMTime(path, mtime string) error {
 	me.CheckAuth()
 	args := []interface{}{me.Token, path, mtime}
-	output = DoAction(me.Url, "setMTime", "POST", args, me.Debug)
-	return
+	err := DoAction(me.Url, "setMTime", "POST", args, me.Debug)
+	return err
 }
 
-func (me *AgileApi) RenameFile(originpath, destpath string) (output bool) {
+func (me *AgileApi) RenameFile(originpath, destpath string) error {
 	me.CheckAuth()
 	args := []interface{}{me.Token, originpath, destpath}
-	output = DoAction(me.Url, "renameFile", "POST", args, me.Debug)
-	return
+	err := DoAction(me.Url, "renameFile", "POST", args, me.Debug)
+	return err
 }
 
-func (me *AgileApi) RmFile(path string) (output bool) {
+func (me *AgileApi) RmFile(path string) error {
 	me.CheckAuth()
 	args := []interface{}{me.Token, path}
-	output = DoAction(me.Url, "deleteFile", "POST", args, me.Debug)
-	return
+	err := DoAction(me.Url, "deleteFile", "POST", args, me.Debug)
+	return err
 }
 
-func (me *AgileApi) RmDir(path string) (output bool) {
+func (me *AgileApi) RmDir(path string) error {
 	me.CheckAuth()
 	args := []interface{}{me.Token, path}
-	output = DoAction(me.Url, "deleteDir", "POST", args, me.Debug)
-	return
+	err := DoAction(me.Url, "deleteDir", "POST", args, me.Debug)
+	return err
 }
 
-func (me *AgileApi) MkDir2(path string) (output bool) {
+func (me *AgileApi) MkDir2(path string) error {
 	me.CheckAuth()
 	args := []interface{}{me.Token, path}
-	output = DoAction(me.Url, "makeDir2", "POST", args, me.Debug)
-	return
+	err := DoAction(me.Url, "makeDir2", "POST", args, me.Debug)
+	return err
 }
 
-func (me *AgileApi) MkDir(path string) (output bool) {
+func (me *AgileApi) MkDir(path string) error {
 	me.CheckAuth()
 	args := []interface{}{me.Token, path}
-	output = DoAction(me.Url, "makeDir", "POST", args, me.Debug)
-	return
+	err := DoAction(me.Url, "makeDir", "POST", args, me.Debug)
+	return err
 }
 
-func (me *AgileApi) StatFile(path string) (output StatResult) {
+func (me *AgileApi) StatFile(path string) (output StatResult, err error) {
 	me.CheckAuth()
 	args := []interface{}{me.Token, path}
 	outputjson := jsonrpcCallNoDecode(me.Url, "stat", "POST", args, me.Debug)
 	var dec StatResponse
-	err := json.Unmarshal([]byte(outputjson), &dec)
+	err = json.Unmarshal([]byte(outputjson), &dec)
 	if err != nil {
-		fmt.Println(err)
+		return
 	}
 	output = dec.Result
 	return
@@ -354,12 +323,8 @@ func (me *AgileApi) ListFiles(path string) (output []ListObject) {
 	err := json.Unmarshal([]byte(outputjson), &dec)
 	if err != nil {
 		fmt.Println(err)
-
 	}
-	//fmt.Println(dec.Cookie)
 	output = dec.Result.Object
-	//fmt.Println("Version 2")
-	//fmt.Println(dec.Result)
 	return
 }
 
@@ -389,7 +354,6 @@ func (me *AgileApi) ListAllDirsDetails(path string) (output []ListFullObject) {
 		err := json.Unmarshal([]byte(outputjson), &dec)
 		if err != nil {
 			fmt.Println(err)
-
 		}
 		loutput := dec.Result.Object
 		mylen = len(loutput)
@@ -432,7 +396,7 @@ func (me *AgileApi) UploadFileStream(path, file string, filereader io.Reader) (e
 		return err
 	}
 	if resp.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("PostRawFail:%s", resp.StatusCode))
+		return fmt.Errorf("PostRawFail: %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -473,4 +437,24 @@ func jsonrpcCallNoDecode(url, method, action string, args []interface{}, debug b
 		log.Fatalf("Error reading response %s", output)
 	}
 	return
+}
+
+func (me *AgileApi) writedebug(message string) {
+	if me.Debug {
+		log.Println("DEBUG - AgileAPI - " + message)
+	}
+}
+
+/*
+func (me *AgileApi) UploadFileWriter(path string) io.writer {
+
+}
+*/
+func (me *AgileApi) NewFS(egress string) *AgileFiles {
+	af := &AgileFiles{
+		AgileApi:  me,
+		EgressURL: egress,
+		Debug:     me.Debug,
+	}
+	return af
 }
